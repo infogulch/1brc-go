@@ -3,28 +3,26 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"os"
+	"runtime"
 	"runtime/pprof"
 	"slices"
 	"strings"
 	"unsafe"
 )
 
-const (
-	BUFFER_SIZE = 4 * 1024 * 1024
-	GOROUTINES  = 8
+const MEGABYTE = 1024 * 1024
+
+var (
+	BUFFER_SIZE int64 = 4 * MEGABYTE
+	WORKERS           = runtime.NumCPU() * 2
 )
 
-type job struct {
-	jobid int64
-	start int64
-	head  <-chan []byte
-	tail  chan<- []byte
-}
-
-// 16 bytes
 type StationData struct {
 	sum      int64
 	count    int32
@@ -53,11 +51,6 @@ func (t *StationData) merge(o *StationData) {
 	}
 }
 
-type StationEntry struct {
-	Name string
-	Data *StationData
-}
-
 type StationMap map[string]*StationData
 
 func (sm StationMap) Get(name []byte) *StationData {
@@ -65,73 +58,103 @@ func (sm StationMap) Get(name []byte) *StationData {
 	if ok {
 		return d
 	} else {
-		d := &StationData{}
+		d := &StationData{min: math.MaxInt16, max: math.MinInt16}
 		sm[string(name)] = d
 		return d
 	}
 }
 
 func main() {
-	f, err := os.Create("cpu_profile.prof")
-	if err != nil {
-		panic(err)
+	profile := flag.Bool("profile", false, "enable profiling")
+	flag.Parse()
+	if *profile {
+		f, err := os.Create("default.pgo")
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			panic(err)
+		}
+		defer pprof.StopCPUProfile()
 	}
-	defer f.Close()
 
-	if err := pprof.StartCPUProfile(f); err != nil {
-		panic(err)
-	}
-	defer pprof.StopCPUProfile()
+	run("measurements.txt", "results.txt")
+}
 
-	osfile := try(os.Open("measurements.txt"))("open file")
-	filesize := try(osfile.Stat())("stat file").Size()
-	file := io.ReaderAt(osfile)
+type job struct {
+	jobid int64
+	start int64
+	head  <-chan []byte
+	tail  chan<- []byte
+}
 
-	jobs := make(chan job, 100)
-	results := make(chan StationMap, GOROUTINES)
+func run(measureFile, outFile string) {
 
-	for range GOROUTINES {
+	jobs := make(chan job, WORKERS*4)
+	results := make(chan StationMap, WORKERS)
+
+	// ReaderAt allows multiple workers to read from the file in
+	// parallel without conflicts
+	var file io.ReaderAt
+
+	// start workers
+	for range WORKERS {
 		go func() {
+			// each worker owns its buffer, and accumulates data to its own map
 			buf := make([]byte, BUFFER_SIZE)
 			smap := make(StationMap)
 			for job := range jobs {
 				n, err := file.ReadAt(buf, job.start)
 				if err != nil && err != io.EOF {
-					try0(err, "read file")
+					panic(fmt.Errorf("failed to read file: %w", err))
 				}
 
 				first, last := process(buf[:n], smap)
 
-				// last is a slice of buf which will be overwritten on next iteration; send clone
+				// last is a slice of buf which will be overwritten on next
+				// iteration; send clone to next worker
 				job.tail <- bytes.Clone(last)
 
-				// reprocess the first line with the last line from the previous map
-				process(append(<-job.head, first...), smap)
+				// reprocess the first line with the last line from the previous
+				// worker
+				first = slices.Concat([]byte{'\n'}, <-job.head, first, []byte{'\n'})
+				process(first, smap)
 
-				if job.jobid&(127) == 0 {
-					fmt.Printf("completed job #%d at offset %d\n", job.jobid, job.start)
+				if job.jobid&(BUFFER_SIZE>>15-1) == 0 {
+					log.Printf("completed job #%d at offset %dMB\n", job.jobid, job.start/MEGABYTE)
 				}
 			}
 			results <- smap
 		}()
 	}
 
+	// fill job queue
 	{
-		numjobs := int64(0)
+		osfile := try(os.Open(measureFile))("open file")
+		filesize := try(osfile.Stat())("stat file").Size()
+		file = io.ReaderAt(osfile)
 		head := make(chan []byte, 1)
 		head <- nil
-		for start := int64(0); start < filesize; start += BUFFER_SIZE {
-			numjobs += 1
+		var jobid, start int64
+		for start < filesize {
 			tail := make(chan []byte, 1)
-			jobs <- job{numjobs, start, head, tail}
+			jobs <- job{jobid, start, head, tail}
 			head = tail
+			jobid++
+			start += BUFFER_SIZE
 		}
-		close(jobs)
-		// fmt.Printf("started %d jobs\n", numjobs)
+		close(jobs) // note: closing jobs causes workers to break only after all jobs are done.
 	}
 
+	// after a worker finishes it sends its map to results chan. accumulate map
+	// data into a sorted list for printing.
+	type StationEntry struct {
+		Name string
+		Data *StationData
+	}
 	result := make([]StationEntry, 0, 1000)
-	for range GOROUTINES {
+	for range WORKERS {
 		for k, d := range <-results {
 			e := StationEntry{k, d}
 			i, found := slices.BinarySearchFunc(result, e, func(x, y StationEntry) int { return strings.Compare(x.Name, y.Name) })
@@ -143,14 +166,17 @@ func main() {
 		}
 	}
 
-	outf := try(os.OpenFile("results.txt", os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.ModePerm))("open result file")
+	outf := try(os.OpenFile(outFile, os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.ModePerm))("open result file")
 	outf.Seek(0, io.SeekStart)
 	out := bufio.NewWriter(outf)
+	defer out.Flush()
+	out.WriteByte('{')
+	sep := ""
 	for _, e := range result {
-		try(fmt.Fprintf(out, "%s=%.1f/%.1f/%.1f,\n", e.Name, float64(e.Data.min)/10, float64(e.Data.sum)/float64(e.Data.count)/10, float64(e.Data.max)/10))("write result line")
+		fmt.Fprintf(out, "%s%s=%.1f/%.1f/%.1f", sep, e.Name, float64(e.Data.min)/10, math.Round(float64(e.Data.sum)/float64(e.Data.count))/10, float64(e.Data.max)/10)
+		sep = ", "
 	}
-	try0(out.Flush(), "flush output")
-
+	out.WriteString("}\n")
 }
 
 func process(b []byte, smap StationMap) ([]byte, []byte) {
@@ -186,14 +212,10 @@ func parseTemp(numb []byte) int16 {
 
 func try[T any](t T, err error) func(string) T {
 	return func(desc string) T {
-		try0(err, desc)
+		if err != nil {
+			panic(fmt.Errorf("failed to %s: %w", desc, err))
+		}
 		return t
-	}
-}
-
-func try0(err error, desc string) {
-	if err != nil {
-		panic(fmt.Errorf("failed to %s: %w", desc, err))
 	}
 }
 
