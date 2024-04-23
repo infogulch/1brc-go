@@ -5,17 +5,16 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"runtime/pprof"
 	"slices"
-	"sync"
+	"strings"
+	"unsafe"
 )
 
 const (
 	BUFFER_SIZE = 4 * 1024 * 1024
-	GOROUTINES  = 4
-	MAPLEN      = 1 << 15 // with max 10k station names, this remains under 50% fill rate
+	GOROUTINES  = 8
 )
 
 type job struct {
@@ -25,15 +24,11 @@ type job struct {
 	tail  chan<- []byte
 }
 
-// 24 bytes
-// 24 * MAPLEN = 786kb
+// 16 bytes
 type StationData struct {
 	sum      int64
 	count    int32
 	min, max int16
-	otheridx uint16
-	namelen  uint16
-	nameidx  uint32
 }
 
 func (t *StationData) add(x int16) {
@@ -47,115 +42,33 @@ func (t *StationData) add(x int16) {
 	}
 }
 
-func (t *StationData) merge(u *StationData) {
-	t.sum += u.sum
-	t.count += u.count
-	if u.min < t.min {
-		t.min = u.min
+func (t *StationData) merge(o *StationData) {
+	t.count += o.count
+	t.sum += o.sum
+	if t.min > o.min {
+		t.min = o.min
 	}
-	if u.max > t.max {
-		t.max = u.max
-	}
-	if t.nameidx == 0 {
-		t.nameidx = u.nameidx
-		t.namelen = u.namelen
+	if o.max > t.max {
+		t.max = o.max
 	}
 }
 
-func (t *StationData) name() []byte {
-	return namesBuf[t.nameidx : t.nameidx+uint32(t.namelen)]
+type StationEntry struct {
+	Name string
+	Data *StationData
 }
 
-type StationMap []StationData
+type StationMap map[string]*StationData
 
 func (sm StationMap) Get(name []byte) *StationData {
-	i1, i2 := hash2(name)
-	d1, d2 := &sm[i1], &sm[i2]
-	if d1.otheridx == i2 {
-		// debug: check name
-		return d1
+	d, ok := sm[bytesToString(name)] // temporary read-only usage is safe
+	if ok {
+		return d
+	} else {
+		d := &StationData{}
+		sm[string(name)] = d
+		return d
 	}
-	if d2.otheridx == i1 {
-		// debug: check name
-		return d2
-	}
-	nameidx := getNameIdx(name)
-	namelen := uint16(len(name))
-	if d1.nameidx == 0 {
-		d1.nameidx = nameidx
-		d1.namelen = namelen
-		d1.otheridx = i2
-		return d1
-	}
-	if d2.nameidx == 0 {
-		d2.nameidx = nameidx
-		d2.namelen = namelen
-		d2.otheridx = i1
-		return d2
-	}
-	if s := &sm[d1.otheridx]; s.nameidx == 0 {
-		*d1, *s = *s, *d1
-		d1.otheridx, s.otheridx = s.otheridx, d1.otheridx
-		d1.nameidx = nameidx
-		d1.namelen = namelen
-		d1.otheridx = i2
-		return d1
-	}
-	if s := &sm[d2.otheridx]; s.nameidx == 0 {
-		*d2, *s = *s, *d2
-		d2.otheridx, s.otheridx = s.otheridx, d2.otheridx
-		d2.nameidx = nameidx
-		d2.namelen = namelen
-		d2.otheridx = i1
-		return d2
-	}
-	panic("double cuckoo move not implemented")
-}
-
-var namesLock sync.RWMutex
-var namesBuf = make([]byte, 1, 100*10000)
-var namesMap = make(map[uint64]uint32)
-
-func getNameIdx(name []byte) uint32 {
-	h := hash(name)
-	namesLock.RLock()
-	if i, ok := namesMap[h]; ok {
-		namesLock.RUnlock()
-		return i
-	}
-	namesLock.RUnlock()
-	namesLock.Lock()
-	if i, ok := namesMap[h]; ok {
-		namesLock.Unlock()
-		return i
-	}
-	i := uint32(len(namesBuf))
-	namesBuf = append(namesBuf, name...)
-	namesMap[h] = i
-	namesLock.Unlock()
-	return i
-}
-
-// https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
-// https://github.com/skeeto/hash-prospector
-func hash(name []byte) uint64 {
-	var x, y uint64 = 0xd6e8feb86659fd93, 0xd6e8feb86659fd93
-	for _, c := range name {
-		x ^= x<<3 + uint64(c)
-		y ^= (y>>11 | y<<53) + uint64(c)
-	}
-	x ^= y
-	x ^= x >> 30
-	x *= 0xbf58476d1ce4e5b9
-	x ^= x >> 27
-	x *= 0x94d049bb133111eb
-	x ^= x >> 31
-	return x
-}
-
-func hash2(name []byte) (uint16, uint16) {
-	x := hash(name)
-	return uint16(x >> 32 * MAPLEN >> 32), uint16(x & math.MaxUint32 * MAPLEN >> 32)
 }
 
 func main() {
@@ -180,7 +93,7 @@ func main() {
 	for range GOROUTINES {
 		go func() {
 			buf := make([]byte, BUFFER_SIZE)
-			smap := make(StationMap, MAPLEN)
+			smap := make(StationMap)
 			for job := range jobs {
 				n, err := file.ReadAt(buf, job.start)
 				if err != nil && err != io.EOF {
@@ -188,7 +101,11 @@ func main() {
 				}
 
 				first, last := process(buf[:n], smap)
-				job.tail <- last
+
+				// last is a slice of buf which will be overwritten on next iteration; send clone
+				job.tail <- bytes.Clone(last)
+
+				// reprocess the first line with the last line from the previous map
 				process(append(<-job.head, first...), smap)
 
 				if job.jobid&(127) == 0 {
@@ -199,36 +116,38 @@ func main() {
 		}()
 	}
 
-	numjobs := int64(0)
-	head := make(chan []byte, 1)
-	head <- nil
-	for start := int64(0); start < filesize; start += BUFFER_SIZE {
-		numjobs += 1
-		tail := make(chan []byte, 1)
-		jobs <- job{numjobs, start, head, tail}
-		head = tail
+	{
+		numjobs := int64(0)
+		head := make(chan []byte, 1)
+		head <- nil
+		for start := int64(0); start < filesize; start += BUFFER_SIZE {
+			numjobs += 1
+			tail := make(chan []byte, 1)
+			jobs <- job{numjobs, start, head, tail}
+			head = tail
+		}
+		close(jobs)
+		// fmt.Printf("started %d jobs\n", numjobs)
 	}
-	close(jobs)
-	fmt.Printf("started %d jobs\n", numjobs)
 
-	result := <-results
-	for range GOROUTINES - 1 {
-		r := <-results
-		for i := range r {
-			t := &r[i]
-			if t.count > 0 {
-				result.Get(t.name()).merge(t)
+	result := make([]StationEntry, 0, 1000)
+	for range GOROUTINES {
+		for k, d := range <-results {
+			e := StationEntry{k, d}
+			i, found := slices.BinarySearchFunc(result, e, func(x, y StationEntry) int { return strings.Compare(x.Name, y.Name) })
+			if !found {
+				result = slices.Insert(result, i, e)
+			} else {
+				result[i].Data.merge(e.Data)
 			}
 		}
 	}
-	slices.SortFunc(result, func(a, b StationData) int { return bytes.Compare(a.name(), b.name()) })
-	result = result[slices.IndexFunc(result, func(s StationData) bool { return s.nameidx > 0 }):]
 
 	outf := try(os.OpenFile("results.txt", os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.ModePerm))("open result file")
 	outf.Seek(0, io.SeekStart)
 	out := bufio.NewWriter(outf)
-	for _, t := range result {
-		try(fmt.Fprintf(out, "%s=%.1f/%.1f/%.1f,\n", t.name(), float64(t.min)/10, float64(t.sum)/float64(t.count)/10, float64(t.max)/10))("write result line")
+	for _, e := range result {
+		try(fmt.Fprintf(out, "%s=%.1f/%.1f/%.1f,\n", e.Name, float64(e.Data.min)/10, float64(e.Data.sum)/float64(e.Data.count)/10, float64(e.Data.max)/10))("write result line")
 	}
 	try0(out.Flush(), "flush output")
 
@@ -245,13 +164,13 @@ func process(b []byte, smap StationMap) ([]byte, []byte) {
 		if j < 0 {
 			break
 		}
-		smap.Get(b[:i]).add(parse(b[i : i+j]))
+		smap.Get(b[:i]).add(parseTemp(b[i+1 : i+j]))
 		b = b[i+j+1:]
 	}
-	return first, bytes.Clone(b)
+	return first, b
 }
 
-func parse(numb []byte) int16 {
+func parseTemp(numb []byte) int16 {
 	var num, sign int16 = 0, 1
 	for _, c := range numb {
 		switch c {
@@ -276,4 +195,9 @@ func try0(err error, desc string) {
 	if err != nil {
 		panic(fmt.Errorf("failed to %s: %w", desc, err))
 	}
+}
+
+// Implementation copied from strings.Builder
+func bytesToString(buf []byte) string {
+	return unsafe.String(unsafe.SliceData(buf), len(buf))
 }
