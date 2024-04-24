@@ -1,5 +1,7 @@
 *.prof
 *.pgo
 measurements.txt
-1brc-go
+results.txt
 *.actual.out
+1brc-go*
+r2p*

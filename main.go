@@ -51,6 +51,11 @@ func (t *StationData) merge(o *StationData) {
 	}
 }
 
+// Implementation copied from strings.Builder
+func bytesToString(buf []byte) string {
+	return unsafe.String(unsafe.SliceData(buf), len(buf))
+}
+
 type StationMap map[string]*StationData
 
 func (sm StationMap) Get(name []byte) *StationData {
@@ -64,22 +69,40 @@ func (sm StationMap) Get(name []byte) *StationData {
 	}
 }
 
-func main() {
-	profile := flag.Bool("profile", false, "enable profiling")
-	flag.Parse()
-	if *profile {
-		f, err := os.Create("default.pgo")
-		if err != nil {
-			panic(err)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			panic(err)
-		}
-		defer pprof.StopCPUProfile()
+func parseTemp(numb []byte) int16 {
+	var num int16
+	var negative bool
+	if numb[0] == '-' {
+		negative = true
+		numb = numb[1:]
 	}
+	for _, c := range numb {
+		if c == '.' {
+			continue
+		}
+		num = num*10 + int16(c-'0')
+	}
+	if negative {
+		return -num
+	}
+	return num
+}
 
-	run("measurements.txt", "results.txt")
+func process(b []byte, smap StationMap) ([]byte, []byte) {
+	first, b, _ := bytes.Cut(b, []byte{'\n'})
+	for len(b) > 0 {
+		i := bytes.IndexByte(b, ';')
+		if i < 0 {
+			break
+		}
+		j := bytes.IndexByte(b[i:], '\n')
+		if j < 0 {
+			break
+		}
+		smap.Get(b[:i]).add(parseTemp(b[i+1 : i+j]))
+		b = b[i+j+1:]
+	}
+	return first, b
 }
 
 type job struct {
@@ -179,37 +202,6 @@ func run(measureFile, outFile string) {
 	out.WriteString("}\n")
 }
 
-func process(b []byte, smap StationMap) ([]byte, []byte) {
-	first, b, _ := bytes.Cut(b, []byte{'\n'})
-	for len(b) > 0 {
-		i := bytes.IndexByte(b, ';')
-		if i < 0 {
-			break
-		}
-		j := bytes.IndexByte(b[i:], '\n')
-		if j < 0 {
-			break
-		}
-		smap.Get(b[:i]).add(parseTemp(b[i+1 : i+j]))
-		b = b[i+j+1:]
-	}
-	return first, b
-}
-
-func parseTemp(numb []byte) int16 {
-	var num, sign int16 = 0, 1
-	for _, c := range numb {
-		switch c {
-		case '.':
-		case '-':
-			sign = -1
-		default:
-			num = num*10 + int16(c-'0')
-		}
-	}
-	return num * sign
-}
-
 func try[T any](t T, err error) func(string) T {
 	return func(desc string) T {
 		if err != nil {
@@ -219,7 +211,20 @@ func try[T any](t T, err error) func(string) T {
 	}
 }
 
-// Implementation copied from strings.Builder
-func bytesToString(buf []byte) string {
-	return unsafe.String(unsafe.SliceData(buf), len(buf))
+func main() {
+	profile := flag.Bool("profile", false, "enable profiling")
+	flag.Parse()
+	if *profile {
+		f, err := os.Create("default.pgo")
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			panic(err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+	run("measurements.txt", "results.txt")
 }
