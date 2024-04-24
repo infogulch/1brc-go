@@ -1,8 +1,8 @@
 # 1brc-go
 
-This is a version of the [1 Billion Row Challenge](1brc) (1brc) written in Go.
-Inspired by blog posts by [Renato Pereira (r2p.dev)](r2p) and
-[Shraddha Agrawal (bytesizego.com)](bsg).
+This is a version of the [1 Billion Row Challenge][1brc] (1brc) written in Go.
+Inspired by blog posts by [Renato Pereira (r2p.dev)][r2p] and
+[Shraddha Agrawal (bytesizego.com)][bsg].
 
 [1brc]: https://github.com/gunnarmorling/1brc
 [r2p]: https://r2p.dev/b/2024-03-18-1brc-go/
