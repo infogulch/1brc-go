@@ -16,12 +16,12 @@ import (
 	"unsafe"
 )
 
-const MEGABYTE = 1024 * 1024
-
-var (
+const (
+	MEGABYTE          = 1024 * 1024
 	BUFFER_SIZE int64 = 4 * MEGABYTE
-	WORKERS           = runtime.NumCPU() * 2
 )
+
+var WORKERS = runtime.NumCPU() * 2
 
 type StationData struct {
 	sum      int64
